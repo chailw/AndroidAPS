@@ -1,0 +1,127 @@
+name: AAPS Build (Artifacts)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tagName:
+        description: 'Select AAPS Version'
+        required: true
+        default: '3.4.2.6'
+        type: choice
+        options:
+          - 3.4.2.6
+          - 3.4.2.4
+          - 3.3.2.1
+      buildVariant:
+        description: 'Select Build Variant'
+        required: true
+        default: 'fullRelease'
+        type: choice
+        options:
+          - fullRelease
+          - fullDebug
+
+jobs:
+  build:
+    name: Build AAPS APKs
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - name: Decode KEYSTORE_SET
+        run: |
+          DECODED=$(echo "${{ secrets.KEYSTORE_SET }}" | base64 -d)
+          echo "KEYSTORE_BASE64=$(echo "$DECODED" | cut -d'|' -f1)" >> $GITHUB_ENV
+          echo "KEYSTORE_PASSWORD=$(echo "$DECODED" | cut -d'|' -f2)" >> $GITHUB_ENV
+          echo "KEY_ALIAS=$(echo "$DECODED" | cut -d'|' -f3)" >> $GITHUB_ENV
+          echo "KEY_PASSWORD=$(echo "$DECODED" | cut -d'|' -f4)" >> $GITHUB_ENV
+          echo "::add-mask::$KEYSTORE_BASE64"
+          echo "::add-mask::$KEYSTORE_PASSWORD"
+          echo "::add-mask::$KEY_ALIAS"
+          echo "::add-mask::$KEY_PASSWORD"
+          echo "✅ KEYSTORE_SET decoded"
+
+      - name: Check Secrets
+        run: |
+          MISSING=0
+          for v in KEYSTORE_BASE64 KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
+            if [ -z "${!v}" ]; then echo "❌ Missing secret: $v"; MISSING=1; fi
+          done
+          if [ "$MISSING" -eq 1 ]; then echo "🛑 Missing required secrets. Stopping build."; exit 1; fi
+          echo "✅ All required secrets are present."
+
+      - name: Decode keystore file
+        run: |
+          mkdir -p "$RUNNER_TEMP/keystore"
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/keystore/keystore.jks"
+
+      - name: Validating keystore
+        run: |
+          set -x
+          echo "test" > dummy.txt
+          zip -q dummy.jar dummy.txt
+          rm dummy.txt
+          JARSIGNER_LOG=$(mktemp)
+          if ! jarsigner -keystore "$RUNNER_TEMP/keystore/keystore.jks" \
+              -storepass "$KEYSTORE_PASSWORD" -keypass "$KEY_PASSWORD" \
+              dummy.jar "$KEY_ALIAS" > "$JARSIGNER_LOG" 2>&1; then
+            echo "❌ Keystore validation failed"
+            cat "$JARSIGNER_LOG"
+            rm -f "$JARSIGNER_LOG" dummy.jar
+            exit 1
+          fi
+          rm -f "$JARSIGNER_LOG" dummy.jar
+          echo "✅ Keystore, alias, and key password are valid."
+
+      - name: Checkout fork
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Fetch selected tag from upstream
+        run: |
+          git remote add upstream https://github.com/nightscout/AndroidAPS.git || true
+          git fetch upstream refs/tags/${{ github.event.inputs.tagName }}:refs/tags/${{ github.event.inputs.tagName }}
+          git checkout refs/tags/${{ github.event.inputs.tagName }}
+          echo "✅ Tag ${{ github.event.inputs.tagName }} checked out"
+
+      - name: Set up JDK
+        uses: actions/setup-java@v5
+        with:
+          java-version: 21
+          distribution: 'temurin'
+          cache: gradle
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Build APKs
+        run: |
+              ./gradlew :app:assemble${{ github.event.inputs.buildVariant }} :wear:assemble${{ github.event.inputs.buildVariant }} \
+              -Dorg.gradle.jvmargs="-Xmx8g -XX:+UseParallelGC -Xss1024m" \
+              -Dkotlin.daemon.jvm.options="-Xmx2g" \
+              -Dkotlin.compiler.execution.strategy="in-process" \
+              -Dorg.gradle.daemon=true \
+              -Dorg.gradle.workers.max=8 \
+              -Dorg.gradle.caching=true \
+              -Pandroid.injected.signing.store.file="$RUNNER_TEMP/keystore/keystore.jks" \
+              -Pandroid.injected.signing.store.password="$KEYSTORE_PASSWORD" \
+              -Pandroid.injected.signing.key.alias="$KEY_ALIAS" \
+              -Pandroid.injected.signing.key.password="$KEY_PASSWORD"
+
+      - name: Rename APKs with version
+        run: |
+          VERSION="${{ github.event.inputs.tagName }}"
+          VARIANT_FLAVOR=$(echo "${{ github.event.inputs.buildVariant }}" | sed -E 's/(Release|Debug)$//' | tr '[:upper:]' '[:lower:]')
+          VARIANT_TYPE=$(echo "${{ github.event.inputs.buildVariant }}" | grep -oE '(Release|Debug)$' | tr '[:upper:]' '[:lower:]')
+          mv app/build/outputs/apk/$VARIANT_FLAVOR/$VARIANT_TYPE/*.apk aaps-$VERSION.apk
+          mv wear/build/outputs/apk/$VARIANT_FLAVOR/$VARIANT_TYPE/*.apk aaps-wear-$VERSION.apk
+          ls -la aaps-*.apk
+
+      - name: Upload APK artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: aaps-apk
+          path: aaps-*.apk
+          retention-days: 90
